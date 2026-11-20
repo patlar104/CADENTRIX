@@ -11,14 +11,28 @@ fn include(entry: &DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy();
     !name.starts_with('.') && !EXCLUDED.contains(&name.as_ref()) && !entry.file_type().is_symlink()
 }
+fn validate_workspace_scope(root: &Path) -> Result<()> {
+    let unavailable = || AppError::job("The configured workspace is no longer available. No report was produced.");
+    let metadata = root.symlink_metadata().map_err(|_| unavailable())?;
+    let canonical = root.canonicalize().map_err(|_| unavailable())?;
+    // Store binds a canonical path at startup. Re-resolve it without adopting a
+    // new target, including when a parent directory has become a symlink.
+    if metadata.file_type().is_symlink() || canonical != root {
+        return Err(AppError::job("The configured workspace boundary changed. No report was produced."));
+    }
+    if !metadata.is_dir() { return Err(unavailable()); }
+    Ok(())
+}
+/// Inventory the canonical workspace path bound by `Store::open`.
 pub fn inspect_workspace(root: &Path) -> Result<Report> {
-    if !root.is_dir() { return Err(AppError::job("The configured workspace is no longer available. No report was produced.")); }
+    validate_workspace_scope(root)?;
     let started = Instant::now();
     let mut report = Report { workspace_name: root.file_name().unwrap_or_default().to_string_lossy().into_owned(), generated_at: now(), file_count: 0, total_bytes: 0, file_types: BTreeMap::new(), top_directories: BTreeMap::new(), manifests: vec![], sample_files: vec![], partial: false, notes: vec!["Read-only native worker. File contents were not read; project commands and tests were not executed.".into(), "Hidden paths, symlinks, dependencies, build output, backend data and QA captures were excluded.".into()], markdown: String::new() };
-    for (count, entry) in WalkDir::new(root).follow_links(false).max_depth(MAX_DEPTH).sort_by_file_name().into_iter().filter_entry(include).enumerate() {
+    for (count, entry) in WalkDir::new(root).follow_links(false).follow_root_links(false).max_depth(MAX_DEPTH).sort_by_file_name().into_iter().filter_entry(include).enumerate() {
         if count >= MAX_ENTRIES { report.partial = true; report.notes.push(format!("Inventory stopped at the {MAX_ENTRIES}-entry limit.")); break; }
         if started.elapsed() > Duration::from_secs(15) { return Err(AppError::job("Inspection exceeded its cooperative time budget. No complete report was published.")); }
         let entry = entry.map_err(|_| AppError::job("An entry in the configured workspace could not be read. No complete report was published."))?;
+        if entry.depth() == 0 && !entry.file_type().is_dir() { return Err(AppError::job("The configured workspace boundary changed. No report was produced.")); }
         if entry.file_type().is_dir() {
             if entry.depth() == MAX_DEPTH { report.partial = true; }
             continue;
@@ -38,6 +52,7 @@ pub fn inspect_workspace(root: &Path) -> Result<Report> {
         if report.sample_files.len() < 30 { report.sample_files.push(path); }
     }
     if report.partial && !report.notes.iter().any(|note| note.contains("entry limit")) { report.notes.push(format!("Directory depth was limited to {MAX_DEPTH}; this is a partial inventory.")); }
+    validate_workspace_scope(root)?;
     verify(&report)?;
     Ok(report)
 }
@@ -63,8 +78,8 @@ fn markdown(report: &Report, objective: &str) -> String {
     text
 }
 pub fn execute_run(store: &Store, run: &Run) -> Result<()> {
-    let result = (|| {
-        if !store.workspace().is_dir() { return Err(AppError::job("The configured workspace is no longer available.")); }
+    let result: Result<()> = (|| {
+        validate_workspace_scope(store.workspace())?;
         store.finish_stage(run, 0, "Configured read-only workspace scope validated.", None)?;
         let mut report = inspect_workspace(store.workspace())?;
         store.finish_stage(run, 1, &format!("Inventoried {} files ({} bytes){}.", report.file_count, report.total_bytes, if report.partial { "; partial bounded inventory" } else { "" }), None)?;
@@ -72,6 +87,7 @@ pub fn execute_run(store: &Store, run: &Run) -> Result<()> {
         store.finish_stage(run, 2, "File-type and directory totals match the inventory. No project tests were executed.", None)?;
         let task = store.get_task(&run.task_id)?;
         report.markdown = markdown(&report, &task.objective);
+        validate_workspace_scope(store.workspace())?;
         store.finish_stage(run, 3, "Project inspection report saved to SQLite. Ready to view or download.", Some(report))?;
         Ok(())
     })();

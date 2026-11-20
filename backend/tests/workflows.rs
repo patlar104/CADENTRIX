@@ -171,6 +171,79 @@ fn missing_workspace_records_failed_run_without_fake_success() {
     assert_eq!(store.active_runs().unwrap(), 0);
 }
 
+#[cfg(unix)]
+#[test]
+fn scanner_rejects_workspace_replaced_with_symlink() {
+    let (directory, store) = fixture();
+    let outside = directory.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("outside-only.txt"), "outside scope").unwrap();
+    fs::rename(store.workspace(), directory.path().join("original-project")).unwrap();
+    std::os::unix::fs::symlink(&outside, store.workspace()).unwrap();
+
+    let error = inspect_workspace(store.workspace()).expect_err("a root symlink must not produce an inventory");
+    assert_eq!(error.code, "inspection_failed");
+    assert!(error.message.contains("workspace"));
+}
+
+#[cfg(unix)]
+#[test]
+fn scanner_rejects_workspace_with_replaced_ancestor() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = directory.path().join("parent");
+    let workspace = parent.join("project");
+    fs::create_dir_all(&workspace).unwrap();
+    let store = Store::open(&directory.path().join("db.sqlite3"), &workspace).unwrap();
+    let outside = directory.path().join("outside");
+    fs::create_dir_all(outside.join("project")).unwrap();
+    fs::write(outside.join("project/outside-only.txt"), "outside scope").unwrap();
+    fs::rename(&parent, directory.path().join("original-parent")).unwrap();
+    std::os::unix::fs::symlink(&outside, &parent).unwrap();
+    assert!(fs::symlink_metadata(store.workspace()).unwrap().is_dir(), "the root itself is still a directory");
+
+    let error = inspect_workspace(store.workspace()).expect_err("canonical scope must include ancestors");
+    assert_eq!(error.code, "inspection_failed");
+}
+
+#[cfg(unix)]
+#[test]
+fn each_run_revalidates_workspace_and_persists_boundary_failure() {
+    let (directory, store) = fixture();
+    let completed = store.create_task("First inspection", "Inspect", "Standard").unwrap();
+    execute_run(&store, &store.begin_run(&completed).unwrap()).unwrap();
+    let id = store.create_task("Inspect after replacement", "Inspect", "Standard").unwrap();
+    let outside = directory.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("outside-only.txt"), "outside scope").unwrap();
+    let original = directory.path().join("original-project");
+    fs::rename(store.workspace(), &original).unwrap();
+    std::os::unix::fs::symlink(&outside, store.workspace()).unwrap();
+
+    let run = store.begin_run(&id).unwrap();
+    let error = execute_run(&store, &run).expect_err("each run must reject a changed workspace boundary");
+    assert_eq!(error.code, "inspection_failed");
+    let task = store.get_task(&id).unwrap();
+    assert_eq!(task.status, "failed");
+    assert_eq!(task.step, 0);
+    assert_eq!(task.stages[0].state, "failed");
+    assert!(task.report.is_none());
+    assert_eq!(task.error.as_deref(), Some(error.message.as_str()));
+    assert!(!task.events.iter().any(|event| event.title.ends_with("completed")));
+    assert_eq!(store.active_runs().unwrap(), 0);
+    let connection = rusqlite::Connection::open(directory.path().join("db.sqlite3")).unwrap();
+    let (status, report): (String, Option<String>) = connection.query_row(
+        "SELECT status, report_json FROM runs WHERE id = ?1", [&run.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(status, "failed");
+    assert!(report.is_none());
+
+    fs::remove_file(store.workspace()).unwrap();
+    fs::rename(&original, store.workspace()).unwrap();
+    execute_run(&store, &store.begin_run(&id).unwrap()).unwrap();
+    assert_eq!(store.get_task(&id).unwrap().report.unwrap().file_count, 2);
+}
+
 #[test]
 fn scanner_excludes_hidden_dependencies_outputs_and_symlinks() {
     let (_directory, store) = fixture();

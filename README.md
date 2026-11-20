@@ -60,6 +60,12 @@ Backend tests cover persistent records and reports, API requests, admission owne
 
 Browser verification covers task creation, real execution, report view/download, task switching, refresh persistence, backend stop/reconnect/restart persistence, and desktop/mobile layouts. The report downloaded through the UI was compared with the displayed saved report; the complete task record and activity history were compared before and after a real service restart.
 
+### Testing evidence
+
+TDD reports and validation records live in [`docs/testing/`](docs/testing/).
+
+- [Workspace boundary regression](docs/testing/workspace-boundary.tdd.md): failing-test evidence, passing checks, and limits of the canonical workspace validation fix.
+
 ## Design and hosting
 
 The visual source remains qa/design-reference.png. Existing design-qa.md and qa captures document the earlier simulated prototype; current behavior is described here.
